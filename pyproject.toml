@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tabpfn"
+name = "tabpfn_old"
 version = "0.1.9"
 authors = [
 {name="Noah Hollmann"},

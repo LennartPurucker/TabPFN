@@ -1,8 +1,8 @@
 from functools import partial
-import tabpfn.encoders as encoders
+import tabpfn_old.encoders as encoders
 
-from tabpfn.transformer import TransformerModel
-from tabpfn.utils import get_uniform_single_eval_pos_sampler
+from tabpfn_old.transformer import TransformerModel
+from tabpfn_old.utils import get_uniform_single_eval_pos_sampler
 import torch
 import math
 
@@ -143,7 +143,7 @@ def get_default_spec(test_datasets, valid_datasets):
     return bptt, eval_positions, max_features, max_splits
 
 def get_mlp_prior_hyperparameters(config):
-    from tabpfn.priors.utils import gamma_sampler_f
+    from tabpfn_old.priors.utils import gamma_sampler_f
     config = {hp: (list(config[hp].values())[0]) if type(config[hp]) is dict else config[hp] for hp in config}
 
     if 'random_feature_rotation' not in config:
@@ -173,7 +173,7 @@ def get_gp_prior_hyperparameters(config):
 
 
 def get_meta_gp_prior_hyperparameters(config):
-    from tabpfn.priors.utils import trunc_norm_sampler_f
+    from tabpfn_old.priors.utils import trunc_norm_sampler_f
     config = {hp: (list(config[hp].values())[0]) if type(config[hp]) is dict else config[hp] for hp in config}
 
     if "outputscale_mean" in config:
@@ -189,8 +189,8 @@ def get_meta_gp_prior_hyperparameters(config):
 
 
 def get_model(config, device, should_train=True, verbose=False, state_dict=None, epoch_callback=None):
-    import tabpfn.priors as priors
-    from tabpfn.train import train, Losses
+    import tabpfn_old.priors as priors
+    from tabpfn_old.train import train, Losses
     extra_kwargs = {}
     verbose_train, verbose_prior = verbose >= 1, verbose >= 2
     config['verbose'] = verbose_prior

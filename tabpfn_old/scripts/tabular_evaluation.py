@@ -11,11 +11,11 @@ import numpy as np
 from torch import nn
 
 from torch.utils.checkpoint import checkpoint
-from tabpfn.utils import normalize_data, torch_nanmean, to_ranking_low_mem, remove_outliers
-from tabpfn.scripts.tabular_baselines import get_scoring_string
-from tabpfn.scripts import tabular_metrics
-from tabpfn.scripts.transformer_prediction_interface import *
-from tabpfn.scripts.baseline_prediction_interface import *
+from tabpfn_old.utils import normalize_data, torch_nanmean, to_ranking_low_mem, remove_outliers
+from tabpfn_old.scripts.tabular_baselines import get_scoring_string
+from tabpfn_old.scripts import tabular_metrics
+from tabpfn_old.scripts.transformer_prediction_interface import *
+from tabpfn_old.scripts.baseline_prediction_interface import *
 """
 ===============================
 PUBLIC FUNCTIONS FOR EVALUATION

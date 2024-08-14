@@ -30,10 +30,10 @@ np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
 import torch
 import itertools
-from tabpfn.scripts import tabular_metrics
+from tabpfn_old.scripts import tabular_metrics
 import pandas as pd
 from tqdm import tqdm
-from tabpfn.utils import remove_outliers
+from tabpfn_old.utils import remove_outliers
 
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.model_selection import cross_val_score
@@ -241,7 +241,7 @@ import torch
 import random
 from tqdm import tqdm
 def transformer_metric(x, y, test_x, test_y, cat_features, metric_used, max_time=300, device='cpu', N_ensemble_configurations=3, classifier=None):
-    from tabpfn.scripts.transformer_prediction_interface import TabPFNClassifier
+    from tabpfn_old.scripts.transformer_prediction_interface import TabPFNClassifier
 
     if classifier is None:
       classifier = TabPFNClassifier(device=device, N_ensemble_configurations=N_ensemble_configurations)

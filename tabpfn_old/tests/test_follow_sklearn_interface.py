@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pickle
 
-from tabpfn import TabPFNClassifier
+from tabpfn_old import TabPFNClassifier
 
 
 

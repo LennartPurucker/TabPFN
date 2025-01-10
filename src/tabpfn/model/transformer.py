@@ -14,7 +14,16 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-
+from tabpfn.model.encoders import (
+    InputNormalizationEncoderStep,
+    LinearInputEncoderStep,
+    MulticlassClassificationTargetEncoder,
+    NanHandlingEncoderStep,
+    RemoveDuplicateFeaturesEncoderStep,
+    RemoveEmptyFeaturesEncoderStep,
+    SequentialEncoder,
+    VariableNumFeaturesEncoderStep,
+)
 from tabpfn.model.encoders import (
     LinearInputEncoderStep,
     NanHandlingEncoderStep,
@@ -92,6 +101,7 @@ class PerFeatureTransformer(nn.Module):
     def __init__(  # noqa: C901, D417, PLR0913
         self,
         *,
+        decoder_n_out: int = 1,
         encoder: nn.Module | None = None,
         ninp: int = DEFAULT_EMSIZE,
         nhead: int = 4,
@@ -177,35 +187,68 @@ class PerFeatureTransformer(nn.Module):
                 TODO: document.
                 for now have a look at layer.py:PerFeatureEncoderLayer.
         """
-        if decoder_dict is None:
-            decoder_dict = {"standard": (None, 1)}
 
         super().__init__()
 
-        if encoder is None:
-            encoder = SequentialEncoder(
-                LinearInputEncoderStep(
-                    num_features=1,
-                    emsize=DEFAULT_EMSIZE,
-                    replace_nan_by_zero=False,
-                    bias=True,
-                    in_keys=("main",),
-                    out_keys=("output",),
-                ),
-            )
+        # -- X encoder
+        num_features = 1
+        inputs_to_merge = {"main": {"dim": num_features}}
+        inputs_to_merge["nan_indicators"] = {"dim": num_features}
+        encoder_steps = [
+            RemoveEmptyFeaturesEncoderStep(),
+            NanHandlingEncoderStep(keep_nans=True),
+            VariableNumFeaturesEncoderStep(
+                num_features=num_features,
+                normalize_by_used_features=False,
+                in_keys=["nan_indicators"],
+                out_keys=["nan_indicators"],
+            ),
+            InputNormalizationEncoderStep(
+                normalize_on_train_only=True,
+                normalize_to_ranking=False,
+                normalize_x=True,
+                remove_outliers=False,
+            ),
+            VariableNumFeaturesEncoderStep(
+                num_features=num_features,
+                normalize_by_used_features=True,
+            ),
+            LinearInputEncoderStep(
+                num_features=sum([i["dim"] for i in inputs_to_merge.values()]),
+                emsize=DEFAULT_EMSIZE,
+                bias=False,
+                in_keys=tuple(inputs_to_merge),
+                out_keys=("output",),
+            ),
+        ]
+        encoder = SequentialEncoder(*encoder_steps, output_key="output")
 
-        if y_encoder is None:
-            y_encoder = SequentialEncoder(
-                NanHandlingEncoderStep(),
-                LinearInputEncoderStep(
-                    num_features=2,
-                    emsize=DEFAULT_EMSIZE,
-                    replace_nan_by_zero=False,
-                    bias=True,
-                    out_keys=("output",),
-                    in_keys=("main", "nan_indicators"),
-                ),
+        # -- y encoder
+        num_inputs = 1
+        inputs_to_merge = [{"name": "main", "dim": num_inputs}, {"name": "nan_indicators", "dim": num_inputs}]
+        steps = [
+            NanHandlingEncoderStep(),
+            # if max_num_classes >= 2:
+            #     steps += [MulticlassClassificationTargetEncoder()]
+            LinearInputEncoderStep(
+                num_features=sum([i["dim"] for i in inputs_to_merge]),  # type: ignore
+                emsize=DEFAULT_EMSIZE,
+                in_keys=tuple(i["name"] for i in inputs_to_merge),  # type: ignore
+                out_keys=("output",),
             )
+        ]
+        y_encoder = SequentialEncoder(*steps, output_key="output")
+
+        # Rest
+        layer_creator = lambda: PerFeatureEncoderLayer(
+            d_model=ninp,
+            nhead=nhead,
+            dim_feedforward=nhid,
+            activation=activation,
+            zero_init=zero_init,
+            **layer_kwargs,
+        )
+        nlayers_encoder = nlayers
 
         self.encoder = encoder
         self.y_encoder = y_encoder
@@ -214,28 +257,10 @@ class PerFeatureTransformer(nn.Module):
         self.nhid = nhid
         self.init_method = init_method
         self.features_per_group = features_per_group
-        self.cache_trainset_representation = cache_trainset_representation
-        self.cached_embeddings: torch.Tensor | None = None
-
-        layer_creator = lambda: PerFeatureEncoderLayer(
-            d_model=ninp,
-            nhead=nhead,
-            dim_feedforward=nhid,
-            activation=activation,
-            zero_init=zero_init,
-            precomputed_kv=(
-                precomputed_kv.pop(0) if precomputed_kv is not None else None
-            ),
-            **layer_kwargs,
-        )
-        if repeat_same_layer:
-            layer = layer_creator()
-            layer_creator = lambda: layer
-
-        nlayers_encoder = nlayers
-        if use_separate_decoder and nlayers_decoder is None:
-            nlayers_decoder = max((nlayers // 3) * 1, 1)
-            nlayers_encoder = max((nlayers // 3) * 2, 1)
+        self.transformer_decoder = None
+        self.global_att_embeddings_for_compression = None
+        self.dag_pos_enc_dim = dag_pos_enc_dim
+        self.seed = seed if seed is not None else random.randint(0, 1_000_000)  # noqa: S311
 
         self.transformer_encoder = LayerStack(
             layer_creator=layer_creator,
@@ -243,56 +268,21 @@ class PerFeatureTransformer(nn.Module):
             recompute_each_layer=recompute_layer,
             min_num_layers_layer_dropout=min_num_layers_layer_dropout,
         )
-
-        self.transformer_decoder = None
-        if use_separate_decoder:
-            assert nlayers_decoder is not None
-            self.transformer_decoder = LayerStack(
-                layer_creator=layer_creator,
-                num_layers=nlayers_decoder,
-            )
-
-        self.global_att_embeddings_for_compression = None
-        if use_encoder_compression_layer:
-            assert use_separate_decoder
-            num_global_att_tokens_for_compression = 512
-
-            self.global_att_embeddings_for_compression = nn.Embedding(
-                num_global_att_tokens_for_compression,
-                ninp,
-            )
-
-            self.encoder_compression_layer = LayerStack(
-                layer_creator=layer_creator,
-                num_layers=2,
-            )
-
-        initialized_decoder_dict = {}
-        for decoder_key in decoder_dict:
-            decoder_model, decoder_n_out = decoder_dict[decoder_key]
-            if decoder_model is None:
-                initialized_decoder_dict[decoder_key] = nn.Sequential(
-                    nn.Linear(ninp, nhid),
-                    nn.GELU(),
-                    nn.Linear(nhid, decoder_n_out),
-                )
-            else:
-                initialized_decoder_dict[decoder_key] = decoder_model(
-                    ninp,
-                    nhid,
-                    decoder_n_out,
-                )
-        self.decoder_dict = nn.ModuleDict(initialized_decoder_dict)
+        self.decoder = nn.Sequential(
+                nn.Linear(ninp * 20, ninp * 10),
+                nn.GELU(),
+                nn.Linear(ninp * 10, ninp * 5),
+                nn.GELU(),
+                nn.Linear(ninp * 5, nhid),
+                nn.GELU(),
+                nn.Linear(nhid, decoder_n_out),
+        )
 
         self.feature_positional_embedding = feature_positional_embedding
         if feature_positional_embedding == "learned":
             self.feature_positional_embedding_embeddings = nn.Embedding(1_000, ninp)
         elif feature_positional_embedding == "subspace":
             self.feature_positional_embedding_embeddings = nn.Linear(ninp // 4, ninp)
-
-        self.dag_pos_enc_dim = dag_pos_enc_dim
-        self.cached_feature_positional_embeddings: torch.Tensor | None = None
-        self.seed = seed if seed is not None else random.randint(0, 1_000_000)  # noqa: S311
 
         # Device on which the generator was last initialized.
         # If loading from a checkpoint, this might be false,
@@ -341,85 +331,34 @@ class PerFeatureTransformer(nn.Module):
     # such as forward, forward_with_test, forward_with_style?
     # The documentation generator complains about this function because we are
     # documenting parameters that don't exist in the signature
-    def forward(self, *args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:  # noqa: D417
+    def forward(self, train_x, train_y, test_x, categorical_inds = None) -> dict[str, torch.Tensor]:  # noqa: D417
         """Performs a forward pass through the model.
 
-        This method supports multiple calling conventions:
-
-        - `model((x,y), **kwargs)`
-        - `model(train_x, train_y, test_x, **kwargs)`
-        - `model((style,x,y), **kwargs)`
 
         Args:
-            train_x: torch.Tensor | None
+            train_x: torch.Tensor
                 The input data for the training set.
-            train_y: torch.Tensor | None
+            train_y: torch.Tensor
                 The target data for the training set.
-            test_x: torch.Tensor | None
+            test_x: torch.Tensor
                 The input data for the test set.
-            x: torch.Tensor
-                The input data.
-            y: torch.Tensor | None
-                The target data.
-            style: torch.Tensor | None
-                The style vector.
-            single_eval_pos: int
-                The position to evaluate at.
-            only_return_standard_out: bool
-                Whether to only return the standard output.
-            data_dags: Any
-                The data DAGs for each example.
             categorical_inds: list[int]
                 The indices of categorical features.
-            freeze_kv: bool
-                Whether to freeze the key and value weights.
 
         Returns:
             The output of the model, which can be a tensor or a dictionary of tensors.
         """
         self._init_rnd()
-        half_layers = kwargs.pop("half_layers", False)
-        assert half_layers is False
 
-        supported_kwargs = {
-            "only_return_standard_out",
-            "style",
-            "data_dags",
-            "categorical_inds",
-            "freeze_kv",
-            "train_x",
-            "train_y",
-            "test_x",
-            "single_eval_pos",
-        }
-        spurious_kwargs = set(kwargs.keys()) - supported_kwargs
-        assert not spurious_kwargs, spurious_kwargs
 
-        if args == () and all(k in kwargs for k in ("train_x", "train_y", "test_x")):
-            assert "single_eval_pos" not in kwargs
-            x = kwargs.pop("train_x")
-            train_y = kwargs.pop("train_y")
-            test_x = kwargs.pop("test_x")
-            if test_x is not None:
-                x = torch.cat((x, test_x), dim=0)
-            return self._forward(x, train_y, single_eval_pos=len(train_y), **kwargs)
+        x = torch.cat((train_x, test_x), dim=0)
+        return self._forward(x, train_y, single_eval_pos=len(train_y), categorical_inds=categorical_inds)
 
-        if len(args) == 2:
-            x, y = args
-            return self._forward(x, y, **kwargs)
-
-        if len(args) == 3:
-            style, x, y = args
-            return self._forward(x, y, style=style, **kwargs)
-
-        raise ValueError("Unrecognized input. Please follow the doc string.")
 
     def _forward(  # noqa: PLR0912, C901
         self,
         x: torch.Tensor | dict,
-        # TODO(eddiebergman): Not sure if it can be None but the function seems to
-        # indicate it could
-        y: torch.Tensor | dict | None,
+        y: torch.Tensor | dict,
         *,
         single_eval_pos: int | None = None,
         only_return_standard_out: bool = True,
@@ -439,39 +378,18 @@ class PerFeatureTransformer(nn.Module):
             style: The style vector.
             data_dags: The data DAGs for each example in the batch.
             categorical_inds: The indices of categorical features.
-            half_layers: Whether to use half the layers.
 
         Returns:
             A dictionary of output tensors.
         """
         assert style is None
-        if self.cache_trainset_representation:
-            if not single_eval_pos:  # none or 0
-                assert y is None
-        else:
-            assert y is not None
-            assert single_eval_pos
+        assert y is not None
+        assert single_eval_pos
 
         single_eval_pos_ = single_eval_pos or 0
-        if isinstance(x, dict):
-            assert "main" in set(x.keys()), f"Main must be in input keys: {x.keys()}."
-        else:
-            x = {"main": x}
+        x = {"main": x}
+        y = {"main": y}
         seq_len, batch_size, num_features = x["main"].shape
-
-        if y is None:
-            # TODO: check dtype.
-            y = torch.zeros(
-                0,
-                batch_size,
-                device=x["main"].device,
-                dtype=x["main"].dtype,
-            )
-
-        if isinstance(y, dict):
-            assert "main" in set(y.keys()), f"Main must be in input keys: {y.keys()}."
-        else:
-            y = {"main": y}
 
         for k in x:
             num_features_ = x[k].shape[2]
@@ -563,7 +481,6 @@ class PerFeatureTransformer(nn.Module):
         embedded_y = self.y_encoder(
             y,
             single_eval_pos=single_eval_pos_,
-            cache_trainset_representation=self.cache_trainset_representation,
         ).transpose(0, 1)
 
         del y
@@ -587,7 +504,6 @@ class PerFeatureTransformer(nn.Module):
             self.encoder(
                 x,
                 single_eval_pos=single_eval_pos_,
-                cache_trainset_representation=self.cache_trainset_representation,
                 **extra_encoders_args,
             ),
             "s (b f) e -> b s f e",
@@ -601,12 +517,6 @@ class PerFeatureTransformer(nn.Module):
             data_dags=data_dags,
             num_features=num_features,
             seq_len=seq_len,
-            cache_embeddings=(
-                self.cache_trainset_representation and single_eval_pos is not None
-            ),
-            use_cached_embeddings=(
-                self.cache_trainset_representation and single_eval_pos is None
-            ),
         )
         del data_dags
 
@@ -629,50 +539,36 @@ class PerFeatureTransformer(nn.Module):
                 else embedded_input[:, :single_eval_pos_]
             ),
             single_eval_pos=single_eval_pos,
-            half_layers=half_layers,
-            cache_trainset_representation=self.cache_trainset_representation,
         )  # b s f+1 e -> b s f+1 e
 
-        # If we are using a decoder
-        if self.transformer_decoder:
-            assert not half_layers
-            assert encoder_out.shape[1] == single_eval_pos_
-
-            if self.global_att_embeddings_for_compression is not None:
-                # TODO: fixed number of compression tokens
-                train_encoder_out = self.encoder_compression_layer(
-                    self.global_att_embeddings_for_compression,
-                    att_src=encoder_out[:, single_eval_pos_],
-                    single_eval_pos=single_eval_pos_,
-                )
-
-            test_encoder_out = self.transformer_decoder(
-                embedded_input[:, single_eval_pos_:],
-                single_eval_pos=0,
-                att_src=encoder_out,
-            )
-            encoder_out = torch.cat([encoder_out, test_encoder_out], 1)
-            del test_encoder_out
+        # # If we are using a decoder
+        # if self.transformer_decoder:
+        #     assert not half_layers
+        #     assert encoder_out.shape[1] == single_eval_pos_
+        #
+        #     if self.global_att_embeddings_for_compression is not None:
+        #         # TODO: fixed number of compression tokens
+        #         train_encoder_out = self.encoder_compression_layer(
+        #             self.global_att_embeddings_for_compression,
+        #             att_src=encoder_out[:, single_eval_pos_],
+        #             single_eval_pos=single_eval_pos_,
+        #         )
+        #
+        #     test_encoder_out = self.transformer_decoder(
+        #         embedded_input[:, single_eval_pos_:],
+        #         single_eval_pos=0,
+        #         att_src=encoder_out,
+        #     )
+        #     encoder_out = torch.cat([encoder_out, test_encoder_out], 1)
+        #     del test_encoder_out
 
         del embedded_input
 
+        # take last embedding of last row and map to result
         # out: s b e
-        test_encoder_out = encoder_out[:, single_eval_pos_:, -1].transpose(0, 1)
-
-        if only_return_standard_out:
-            assert self.decoder_dict is not None
-            output_decoded = self.decoder_dict["standard"](test_encoder_out)
-        else:
-            output_decoded = (
-                {k: v(test_encoder_out) for k, v in self.decoder_dict.items()}
-                if self.decoder_dict is not None
-                else {}
-            )
-
-            # out: s b e
-            train_encoder_out = encoder_out[:, :single_eval_pos_, -1].transpose(0, 1)
-            output_decoded["train_embeddings"] = train_encoder_out
-            output_decoded["test_embeddings"] = test_encoder_out
+        test_encoder_out = encoder_out[:, single_eval_pos_:, -1]
+        test_encoder_out = einops.rearrange(test_encoder_out, "b s e -> b (s e)")
+        output_decoded = self.decoder(test_encoder_out)
 
         return output_decoded
 
@@ -687,13 +583,6 @@ class PerFeatureTransformer(nn.Module):
         cache_embeddings: bool = False,
         use_cached_embeddings: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if use_cached_embeddings and self.cached_embeddings is not None:
-            assert (
-                data_dags is None
-            ), "Caching embeddings is not supported with data_dags at this point."
-            x += self.cached_embeddings[None, None]
-            return x, y
-
         if (
             self.generator_device != self.generator.device
             or self.generator_device != x.device
@@ -746,63 +635,7 @@ class PerFeatureTransformer(nn.Module):
         else:
             raise ValueError(f"Unknown {self.feature_positional_embedding=}")
 
-        self.cached_embeddings = None
-        if cache_embeddings and embs is not None:
-            assert (
-                data_dags is None
-            ), "Caching embeddings is not supported with data_dags at this point."
-            self.cached_embeddings = embs
-
-        # TODO(old) should this go into encoder?
-        # could also be made a bit more concise by moving down to operate on full_x
-        if data_dags is not None:
-            for b_i, data_dag in enumerate(data_dags):
-                # TODO(eddibergman): Very inneficient way to make a full connect
-                # DiGraph
-                g_: nx.DiGraph = data_dag.copy()
-                while _networkx_add_direct_connections(g_):
-                    pass
-
-                subgraph: nx.DiGraph = g_.subgraph(  # type: ignore
-                    [
-                        n
-                        for n, info in g_.nodes.items()
-                        if (info["is_feature"] or info["is_target"])
-                    ],
-                )
-                k = self.dag_pos_enc_dim
-                assert k > 0
-                _add_pos_emb(subgraph, k=k)
-
-                graph_pos_embs_features = torch.zeros((num_features, k))
-                graph_pos_embs_targets = torch.zeros((1, k))  # shape: (num_targets, k)
-
-                for node_info in subgraph.nodes.values():
-                    for feature_idx in node_info.get("feature_idxs", []):
-                        graph_pos_embs_features[feature_idx] = node_info[
-                            "positional_encoding"
-                        ]
-                    for target_idx in node_info.get("target_idxs", []):
-                        graph_pos_embs_targets[target_idx] = node_info[
-                            "positional_encoding"
-                        ]
-
-                graph_pos_embs_targets -= graph_pos_embs_features.mean(0, keepdim=True)
-                graph_pos_embs_features -= graph_pos_embs_features.mean(0, keepdim=True)
-
-                graph_pos_embs_features = graph_pos_embs_features[None].expand(
-                    seq_len,
-                    -1,
-                    -1,
-                )
-                x[b_i, :, :, :k] += graph_pos_embs_features.to(y.device, y.dtype)
-
-                graph_pos_embs_targets = (
-                    graph_pos_embs_targets[None].expand(seq_len, -1, -1).squeeze(-2)
-                )
-                y[b_i, :, :k] += graph_pos_embs_targets.to(y.device, y.dtype)
-        else:
-            assert not hasattr(self, "dag_pos_enc_dim") or not self.dag_pos_enc_dim
+        assert not hasattr(self, "dag_pos_enc_dim") or not self.dag_pos_enc_dim
 
         return x, y
 

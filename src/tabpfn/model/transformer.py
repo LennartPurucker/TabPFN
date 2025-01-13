@@ -269,11 +269,7 @@ class PerFeatureTransformer(nn.Module):
             min_num_layers_layer_dropout=min_num_layers_layer_dropout,
         )
         self.decoder = nn.Sequential(
-                nn.Linear(ninp * 20, ninp * 10),
-                nn.GELU(),
-                nn.Linear(ninp * 10, ninp * 5),
-                nn.GELU(),
-                nn.Linear(ninp * 5, nhid),
+                nn.Linear(ninp, nhid),
                 nn.GELU(),
                 nn.Linear(nhid, decoder_n_out),
         )
@@ -566,8 +562,8 @@ class PerFeatureTransformer(nn.Module):
 
         # take last embedding of last row and map to result
         # out: s b e
-        test_encoder_out = encoder_out[:, single_eval_pos_:, -1]
-        test_encoder_out = einops.rearrange(test_encoder_out, "b s e -> b (s e)")
+        test_encoder_out = encoder_out[:, -1:, -1]
+        # test_encoder_out = einops.rearrange(test_encoder_out, "b s e -> b (s e)")
         output_decoded = self.decoder(test_encoder_out)
 
         return output_decoded

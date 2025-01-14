@@ -102,20 +102,10 @@ class PerFeatureTransformer(nn.Module):
         self,
         *,
         decoder_n_out: int = 1,
-        encoder: nn.Module | None = None,
-        ninp: int = DEFAULT_EMSIZE,
-        nhead: int = 4,
-        nhid: int = DEFAULT_EMSIZE * 4,
-        nlayers: int = 10,
-        y_encoder: nn.Module | None = None,
-        decoder_dict: dict[str, tuple[type[nn.Module] | None, int]] | None = None,
         init_method: str | None = None,
         activation: Literal["gelu", "relu"] = "gelu",
-        recompute_layer: bool = False,
         min_num_layers_layer_dropout: int | None = None,
-        repeat_same_layer: bool = False,
         dag_pos_enc_dim: int = 0,
-        features_per_group: int = 1,
         feature_positional_embedding: (
             Literal[
                 "normal_rand_vec",
@@ -126,13 +116,6 @@ class PerFeatureTransformer(nn.Module):
             | None
         ) = None,
         zero_init: bool = True,
-        use_separate_decoder: bool = False,
-        nlayers_decoder: int | None = None,
-        use_encoder_compression_layer: bool = False,
-        precomputed_kv: (
-            list[torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
-        ) = None,
-        cache_trainset_representation: bool = False,
         seed: int | None = None,
         # TODO: List explicitly
         **layer_kwargs: Any,
@@ -189,6 +172,13 @@ class PerFeatureTransformer(nn.Module):
         """
 
         super().__init__()
+        embedding_size = 32
+        ninp = embedding_size
+        nhid = embedding_size * 4
+        nhead = 4
+        nlayers = 4
+        features_per_group= 1
+        recompute_layer = True
 
         # -- X encoder
         num_features = 1
@@ -215,7 +205,7 @@ class PerFeatureTransformer(nn.Module):
             ),
             LinearInputEncoderStep(
                 num_features=sum([i["dim"] for i in inputs_to_merge.values()]),
-                emsize=DEFAULT_EMSIZE,
+                emsize=embedding_size,
                 bias=False,
                 in_keys=tuple(inputs_to_merge),
                 out_keys=("output",),
@@ -232,7 +222,7 @@ class PerFeatureTransformer(nn.Module):
             #     steps += [MulticlassClassificationTargetEncoder()]
             LinearInputEncoderStep(
                 num_features=sum([i["dim"] for i in inputs_to_merge]),  # type: ignore
-                emsize=DEFAULT_EMSIZE,
+                emsize=embedding_size,
                 in_keys=tuple(i["name"] for i in inputs_to_merge),  # type: ignore
                 out_keys=("output",),
             )
@@ -271,6 +261,7 @@ class PerFeatureTransformer(nn.Module):
         self.decoder = nn.Sequential(
                 nn.Linear(ninp, nhid),
                 nn.GELU(),
+                # nn.Dropout(p=0.5),  # Dropout layer with 50% dropout rate
                 nn.Linear(nhid, decoder_n_out),
         )
 

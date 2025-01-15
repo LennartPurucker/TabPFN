@@ -115,7 +115,6 @@ class PerFeatureTransformer(nn.Module):
             ]
             | None
         ) = None,
-        zero_init: bool = True,
         seed: int | None = None,
         # TODO: List explicitly
         **layer_kwargs: Any,
@@ -172,13 +171,14 @@ class PerFeatureTransformer(nn.Module):
         """
 
         super().__init__()
-        embedding_size = 32
+        embedding_size = 8
         ninp = embedding_size
         nhid = embedding_size * 4
-        nhead = 4
-        nlayers = 4
+        nhead = 1
+        nlayers = 1
         features_per_group= 1
         recompute_layer = True
+        zero_init = False
 
         # -- X encoder
         num_features = 1

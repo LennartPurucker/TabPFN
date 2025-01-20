@@ -171,11 +171,11 @@ class PerFeatureTransformer(nn.Module):
         """
 
         super().__init__()
-        embedding_size = 32
+        embedding_size = 64
         ninp = embedding_size
         nhid = embedding_size * 4
-        nhead = 1
-        nlayers = 4
+        nhead = 4
+        nlayers = 8
         features_per_group= 1
         recompute_layer = True
         zero_init = False
